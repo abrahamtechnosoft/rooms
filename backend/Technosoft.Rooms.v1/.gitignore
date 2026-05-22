@@ -1,0 +1,8 @@
+node_modules/
+.env
+*.log
+.DS_Store
+.vs/
+coverage/
+uploads/avatars/*
+!uploads/avatars/.gitkeep

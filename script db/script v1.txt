@@ -1,0 +1,1478 @@
+USE TechnosoftRooms;
+GO
+
+ALTER TABLE core.rooms ADD color_hex VARCHAR(20) NULL;
+GO
+
+ALTER TABLE core.rooms ADD icon_name VARCHAR(50) NULL;
+GO
+
+ALTER TABLE core.rooms ADD description VARCHAR(500) NULL;
+GO
+
+-- Defaults para las salas existentes
+UPDATE core.rooms 
+SET color_hex = '#2C3E50', icon_name = 'Building2'
+WHERE room_id = 1; -- Sala Principal
+
+UPDATE core.rooms 
+SET color_hex = '#E67E22', icon_name = 'Briefcase'
+WHERE room_id = 2; -- Sala de Juntas
+
+UPDATE core.rooms 
+SET color_hex = '#8B5CF6', icon_name = 'Video'
+WHERE room_id = 3; -- Reunión virtual
+
+-- Verificacion
+SELECT room_id, name, color_hex, icon_name, description, is_virtual FROM core.rooms;
+
+
+USE TechnosoftRooms;
+GO
+
+ALTER TABLE core.reservations ADD is_external BIT NOT NULL DEFAULT 0;
+GO
+
+ALTER TABLE core.reservations ADD external_location VARCHAR(200) NULL;
+GO
+
+-- Verificacion
+SELECT TOP 1 reservation_id, title, is_external, external_location FROM core.reservations;
+
+INSERT INTO core.rooms (name, capacity, location, is_virtual, color_hex, icon_name, is_active)
+VALUES ('Fuera de oficina', 0, NULL, 0, '#475569', 'MapPin', 0);
+
+USE TechnosoftRooms;
+GO
+
+-- ============================================================
+-- TABLA 1: Asistencia de participantes
+-- ============================================================
+-- Marca si cada participante asistio o no, con motivo opcional.
+-- Se puede marcar durante la reunion o hasta 24h despues.
+
+CREATE TABLE core.reservation_attendance (
+    attendance_id INT IDENTITY(1,1) PRIMARY KEY,
+    reservation_id INT NOT NULL,
+    user_id INT NOT NULL,
+    attended BIT NOT NULL,                       -- 1 = asistio, 0 = no asistio
+    absence_reason VARCHAR(300) NULL,            -- motivo si no asistio (opcional)
+    marked_by INT NOT NULL,                      -- quien marco la asistencia (organizador o admin)
+    marked_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+    
+    CONSTRAINT FK_attendance_reservation 
+        FOREIGN KEY (reservation_id) REFERENCES core.reservations(reservation_id),
+    CONSTRAINT FK_attendance_user 
+        FOREIGN KEY (user_id) REFERENCES auth.users(user_id),
+    CONSTRAINT FK_attendance_marker 
+        FOREIGN KEY (marked_by) REFERENCES auth.users(user_id),
+    CONSTRAINT UQ_attendance_reservation_user 
+        UNIQUE (reservation_id, user_id)
+);
+GO
+
+-- ============================================================
+-- TABLA 2: Notas generales de la reunion
+-- ============================================================
+-- Notas estructuradas que el organizador escribe durante/despues
+-- de la reunion (acuerdos, proximos pasos, comentarios).
+
+CREATE TABLE core.reservation_notes (
+    note_id INT IDENTITY(1,1) PRIMARY KEY,
+    reservation_id INT NOT NULL,
+    author_id INT NOT NULL,
+    content VARCHAR(1000) NOT NULL,
+    created_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+    updated_at DATETIME2 NULL,
+    
+    CONSTRAINT FK_notes_reservation 
+        FOREIGN KEY (reservation_id) REFERENCES core.reservations(reservation_id),
+    CONSTRAINT FK_notes_author 
+        FOREIGN KEY (author_id) REFERENCES auth.users(user_id)
+);
+GO
+
+CREATE INDEX IX_notes_reservation ON core.reservation_notes(reservation_id);
+GO
+
+-- ============================================================
+-- TABLA 3: Invitados externos (clientes, no users del sistema)
+-- ============================================================
+-- Lista de emails externos asociados a una reunion. NO son cuentas
+-- de la app. Solo metadata + opcional envio de invitacion por correo.
+
+CREATE TABLE core.reservation_external_guests (
+    guest_id INT IDENTITY(1,1) PRIMARY KEY,
+    reservation_id INT NOT NULL,
+    email VARCHAR(254) NOT NULL,
+    display_name VARCHAR(120) NULL,              -- nombre opcional del cliente
+    notified BIT NOT NULL DEFAULT 0,             -- si ya se le envio invitacion
+    notified_at DATETIME2 NULL,
+    added_by INT NOT NULL,
+    added_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+    
+    CONSTRAINT FK_guests_reservation 
+        FOREIGN KEY (reservation_id) REFERENCES core.reservations(reservation_id),
+    CONSTRAINT FK_guests_addedby 
+        FOREIGN KEY (added_by) REFERENCES auth.users(user_id),
+    CONSTRAINT UQ_guests_reservation_email 
+        UNIQUE (reservation_id, email)
+);
+GO
+
+CREATE INDEX IX_guests_reservation ON core.reservation_external_guests(reservation_id);
+GO
+
+-- ============================================================
+-- VERIFICACION
+-- ============================================================
+SELECT 
+    t.name AS tabla,
+    COUNT(c.column_id) AS columnas
+FROM sys.tables t
+JOIN sys.schemas s ON s.schema_id = t.schema_id
+LEFT JOIN sys.columns c ON c.object_id = t.object_id
+WHERE s.name = 'core' 
+  AND t.name IN ('reservation_attendance', 'reservation_notes', 'reservation_external_guests')
+GROUP BY t.name
+ORDER BY t.name;
+GO
+
+SELECT TOP 1 * FROM core.reservation_attendance;
+SELECT TOP 1 * FROM core.reservation_notes;
+SELECT TOP 1 * FROM core.reservation_external_guests;
+
+USE TechnosoftRooms;
+GO
+
+ALTER TABLE core.reservations 
+ADD ended_early BIT NOT NULL DEFAULT 0;
+GO
+
+ALTER TABLE core.reservations 
+ADD ended_at DATETIME2 NULL;
+GO
+
+ALTER TABLE core.reservations 
+ADD ended_by INT NULL FOREIGN KEY REFERENCES auth.users(user_id);
+GO
+
+ALTER TABLE core.reservations 
+ADD end_early_reason VARCHAR(300) NULL;
+GO
+
+-- Verificacion
+SELECT TOP 1 
+    reservation_id, title, status, 
+    ends_at, ended_early, ended_at, ended_by, end_early_reason 
+FROM core.reservations;
+
+
+
+
+USE TechnosoftRooms;
+GO
+
+-- ============================================================
+-- FIX: Eliminar el default constraint de is_virtual
+-- ============================================================
+-- Buscar y dropear el default constraint dinamicamente
+DECLARE @defaultName NVARCHAR(200);
+SELECT @defaultName = dc.name
+FROM sys.default_constraints dc
+INNER JOIN sys.columns c 
+    ON c.default_object_id = dc.object_id
+WHERE c.object_id = OBJECT_ID('core.rooms')
+  AND c.name = 'is_virtual';
+
+IF @defaultName IS NOT NULL
+BEGIN
+    DECLARE @sql NVARCHAR(MAX) = 'ALTER TABLE core.rooms DROP CONSTRAINT ' + @defaultName;
+    EXEC sp_executesql @sql;
+    PRINT 'Default constraint eliminado: ' + @defaultName;
+END
+ELSE
+BEGIN
+    PRINT 'No se encontro default constraint en is_virtual';
+END
+GO
+
+-- Ahora si, eliminar la columna
+ALTER TABLE core.rooms
+DROP COLUMN is_virtual;
+GO
+
+-- ============================================================
+-- VERIFICACION FINAL
+-- ============================================================
+
+-- 1. Tipos de reserva
+SELECT reservation_type, COUNT(*) AS total
+FROM core.reservations
+GROUP BY reservation_type;
+
+-- 2. Salas (solo fisicas)
+SELECT room_id, name, capacity, location, is_active
+FROM core.rooms
+ORDER BY room_id;
+
+-- 3. Columnas de core.rooms (NO debe estar is_virtual)
+SELECT COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'core' AND TABLE_NAME = 'rooms'
+ORDER BY ORDINAL_POSITION;
+
+-- 4. Columnas relevantes de core.reservations
+SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'core' AND TABLE_NAME = 'reservations'
+  AND COLUMN_NAME IN ('reservation_type', 'room_id', 'meeting_link', 'external_location')
+ORDER BY COLUMN_NAME;
+
+-- 5. Coherencia
+SELECT 
+    SUM(CASE WHEN reservation_type = 'physical' AND room_id IS NULL THEN 1 ELSE 0 END) AS physical_sin_room,
+    SUM(CASE WHEN reservation_type IN ('virtual','external') AND room_id IS NOT NULL THEN 1 ELSE 0 END) AS virtual_o_external_con_room
+FROM core.reservations;
+
+
+-- core.reservations
+ALTER TABLE core.reservations ADD virtual_platform VARCHAR(20) NULL;
+ALTER TABLE core.reservations ADD external_subtype VARCHAR(30) NULL;
+ALTER TABLE core.reservations ADD external_company VARCHAR(120) NULL;
+ALTER TABLE core.reservations ADD external_address VARCHAR(300) NULL;
+ALTER TABLE core.reservations ADD external_maps_url VARCHAR(500) NULL;
+ALTER TABLE core.reservations ADD external_contact VARCHAR(120) NULL;
+
+
+USE TechnosoftRooms;
+GO
+
+-- Virtual platform solo puede tener valores válidos
+ALTER TABLE core.reservations
+ADD CONSTRAINT CK_reservations_virtual_platform
+    CHECK (
+        virtual_platform IS NULL 
+        OR virtual_platform IN ('meet', 'zoom', 'teams', 'other')
+    );
+GO
+
+-- External subtype solo puede tener valores válidos
+ALTER TABLE core.reservations
+ADD CONSTRAINT CK_reservations_external_subtype
+    CHECK (
+        external_subtype IS NULL 
+        OR external_subtype IN ('client', 'event', 'training', 'other')
+    );
+GO
+
+-- Los campos de virtual solo se setean si type='virtual'
+ALTER TABLE core.reservations
+ADD CONSTRAINT CK_reservations_virtual_fields
+    CHECK (
+        (reservation_type = 'virtual')
+        OR (virtual_platform IS NULL AND meeting_link IS NULL)
+    );
+GO
+
+-- Los campos de external solo se setean si type='external'
+ALTER TABLE core.reservations
+ADD CONSTRAINT CK_reservations_external_fields
+    CHECK (
+        (reservation_type = 'external')
+        OR (
+            external_subtype IS NULL 
+            AND external_company IS NULL 
+            AND external_address IS NULL 
+            AND external_maps_url IS NULL 
+            AND external_contact IS NULL
+            AND external_location IS NULL
+        )
+    );
+GO
+
+-- Verificación
+SELECT name, type_desc
+FROM sys.check_constraints
+WHERE parent_object_id = OBJECT_ID('core.reservations')
+ORDER BY name;
+
+
+
+-- SOLO correr si confirmas que no hay data crítica que perder
+USE TechnosoftRooms;
+GO
+
+-- Si tenías reservas con external_location, migrar a external_address primero
+UPDATE core.reservations
+SET external_address = external_location
+WHERE external_location IS NOT NULL 
+  AND external_address IS NULL;
+GO
+
+-- Después borrar la columna
+ALTER TABLE core.reservations
+DROP COLUMN external_location;
+GO
+
+
+
+
+
+
+USE TechnosoftRooms;
+GO
+
+-- ============================================================
+-- PASO 1: Dropear el constraint que referencia external_location
+-- ============================================================
+IF EXISTS (
+    SELECT 1 FROM sys.check_constraints 
+    WHERE name = 'CK_reservations_external_fields'
+)
+BEGIN
+    ALTER TABLE core.reservations
+    DROP CONSTRAINT CK_reservations_external_fields;
+    PRINT 'Constraint CK_reservations_external_fields eliminado';
+END
+GO
+
+-- ============================================================
+-- PASO 2: Eliminar la columna external_location
+-- ============================================================
+ALTER TABLE core.reservations
+DROP COLUMN external_location;
+GO
+
+PRINT 'Columna external_location eliminada';
+
+-- ============================================================
+-- PASO 3: Recrear el constraint SIN referencia a external_location
+-- ============================================================
+ALTER TABLE core.reservations
+ADD CONSTRAINT CK_reservations_external_fields
+    CHECK (
+        (reservation_type = 'external')
+        OR (
+            external_subtype IS NULL 
+            AND external_company IS NULL 
+            AND external_address IS NULL 
+            AND external_maps_url IS NULL 
+            AND external_contact IS NULL
+        )
+    );
+GO
+
+PRINT 'Constraint CK_reservations_external_fields recreado sin external_location';
+
+-- ============================================================
+-- VERIFICACION FINAL
+-- ============================================================
+
+-- 1. Confirmar que external_location ya no existe
+SELECT COLUMN_NAME 
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'core' 
+  AND TABLE_NAME = 'reservations'
+  AND COLUMN_NAME LIKE 'external%'
+ORDER BY COLUMN_NAME;
+
+-- 2. Listar todos los constraints actuales
+SELECT name, type_desc
+FROM sys.check_constraints
+WHERE parent_object_id = OBJECT_ID('core.reservations')
+ORDER BY name;
+
+-- 3. Columnas finales relevantes
+SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'core' 
+  AND TABLE_NAME = 'reservations'
+  AND COLUMN_NAME IN (
+    'reservation_type',
+    'room_id',
+    'meeting_link',
+    'virtual_platform',
+    'external_subtype',
+    'external_company',
+    'external_address',
+    'external_maps_url',
+    'external_contact'
+  )
+ORDER BY COLUMN_NAME;
+
+USE TechnosoftRooms;
+GO
+
+-- Confirmar que las reservas existentes tienen reservation_type asignado
+SELECT reservation_type, COUNT(*) AS total
+FROM core.reservations
+GROUP BY reservation_type;
+
+-- Confirmar que ninguna physical quedó sin room_id
+SELECT COUNT(*) AS physical_sin_room
+FROM core.reservations
+WHERE reservation_type = 'physical' AND room_id IS NULL;
+
+-- Confirmar que ninguna virtual/external tiene room_id
+SELECT COUNT(*) AS virtual_o_external_con_room
+FROM core.reservations
+WHERE reservation_type IN ('virtual', 'external') AND room_id IS NOT NULL;
+
+
+USE TechnosoftRooms;
+GO
+
+-- ============================================================
+-- TABLA: auth.departments
+-- ============================================================
+CREATE TABLE auth.departments (
+    department_id INT IDENTITY(1,1) PRIMARY KEY,
+    name VARCHAR(60) NOT NULL,
+    description VARCHAR(200) NULL,
+    color_hex VARCHAR(20) NULL,
+    is_active BIT NOT NULL DEFAULT 1,
+    created_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+    CONSTRAINT UQ_departments_name UNIQUE (name)
+);
+GO
+
+-- ============================================================
+-- Agregar department_id a auth.users
+-- ============================================================
+ALTER TABLE auth.users
+ADD department_id INT NULL;
+GO
+
+ALTER TABLE auth.users
+ADD CONSTRAINT FK_users_department
+    FOREIGN KEY (department_id) REFERENCES auth.departments(department_id);
+GO
+
+-- ============================================================
+-- SEED: departamentos default
+-- ============================================================
+INSERT INTO auth.departments (name, description, color_hex)
+VALUES 
+    ('Desarrollo', 'Equipo de desarrollo de software', '#2C3E50'),
+    ('Soporte', 'Soporte técnico y atención a clientes', '#27AE60'),
+    ('Comercial', 'Ventas y atención comercial', '#E67E22'),
+    ('Contabilidad', 'Finanzas y contabilidad', '#8B5CF6'),
+    ('Administración', 'Administración general', '#475569'),
+    ('Gerencia', 'Dirección y gerencia', '#C0392B');
+GO
+
+-- ============================================================
+-- Verificación
+-- ============================================================
+SELECT department_id, name, description, color_hex, is_active
+FROM auth.departments
+ORDER BY department_id;
+
+SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'auth' 
+  AND TABLE_NAME = 'users'
+  AND COLUMN_NAME = 'department_id';
+
+
+ALTER TABLE core.reservations ADD usage_confirmed BIT NOT NULL DEFAULT 0;
+ALTER TABLE core.reservations ADD usage_confirmed_at DATETIME2 NULL;
+ALTER TABLE core.reservations ADD usage_confirmation_requested_at DATETIME2 NULL;
+ALTER TABLE core.reservations ADD reminder_24h_sent BIT NOT NULL DEFAULT 0;
+ALTER TABLE core.reservations ADD reminder_15m_sent BIT NOT NULL DEFAULT 0;
+
+USE TechnosoftRooms;
+GO
+
+-- ============================================================
+-- PROMPT 1: Archivos adjuntos por URL
+-- ============================================================
+
+CREATE TABLE core.reservation_attachments (
+    attachment_id INT IDENTITY(1,1) PRIMARY KEY,
+    reservation_id INT NOT NULL,
+    name VARCHAR(120) NOT NULL,
+    url VARCHAR(1000) NOT NULL,
+    added_by INT NOT NULL,
+    created_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+    
+    CONSTRAINT FK_reservation_attachments_reservation 
+        FOREIGN KEY (reservation_id) REFERENCES core.reservations(reservation_id) 
+        ON DELETE CASCADE,
+    CONSTRAINT FK_reservation_attachments_user 
+        FOREIGN KEY (added_by) REFERENCES auth.users(user_id)
+);
+GO
+
+CREATE INDEX IX_reservation_attachments_reservation 
+    ON core.reservation_attachments(reservation_id);
+GO
+
+-- ============================================================
+-- PROMPT 2: Bloqueos personales + sistema de peticiones
+-- ============================================================
+
+-- Tabla de bloqueos personales del usuario
+CREATE TABLE auth.user_blocks (
+    block_id INT IDENTITY(1,1) PRIMARY KEY,
+    user_id INT NOT NULL,
+    name VARCHAR(80) NOT NULL,                  -- "Almuerzo", "Incapacidad", "Focus time"
+    block_type VARCHAR(20) NOT NULL,            -- 'recurring' | 'one_time'
+    
+    -- Para recurrentes:
+    days_of_week VARCHAR(30) NULL,              -- '1,2,3,4,5' = lun-vie
+    start_time TIME NULL,                       -- 12:00
+    end_time TIME NULL,                         -- 13:00
+    
+    -- Para puntuales (rango de fechas):
+    start_at DATETIME2 NULL,
+    end_at DATETIME2 NULL,
+    
+    is_active BIT NOT NULL DEFAULT 1,
+    created_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+    
+    CONSTRAINT FK_user_blocks_user 
+        FOREIGN KEY (user_id) REFERENCES auth.users(user_id),
+    CONSTRAINT CK_user_blocks_type 
+        CHECK (block_type IN ('recurring', 'one_time')),
+    CONSTRAINT CK_user_blocks_recurring_fields 
+        CHECK (
+            (block_type = 'recurring' AND days_of_week IS NOT NULL 
+                AND start_time IS NOT NULL AND end_time IS NOT NULL)
+            OR
+            (block_type = 'one_time' AND start_at IS NOT NULL AND end_at IS NOT NULL)
+        )
+);
+GO
+
+CREATE INDEX IX_user_blocks_user_active 
+    ON auth.user_blocks(user_id, is_active);
+GO
+
+-- Estado de petición en reservation_participants
+ALTER TABLE core.reservation_participants
+ADD invitation_status VARCHAR(20) NOT NULL DEFAULT 'auto_accepted';
+GO
+
+ALTER TABLE core.reservation_participants
+ADD invitation_response_at DATETIME2 NULL;
+GO
+
+ALTER TABLE core.reservation_participants
+ADD invitation_blocked_by_id INT NULL;
+GO
+
+ALTER TABLE core.reservation_participants
+ADD CONSTRAINT FK_participants_blocked_by 
+    FOREIGN KEY (invitation_blocked_by_id) REFERENCES auth.user_blocks(block_id);
+GO
+
+ALTER TABLE core.reservation_participants
+ADD CONSTRAINT CK_participants_invitation_status 
+    CHECK (invitation_status IN ('auto_accepted', 'pending', 'accepted', 'rejected'));
+GO
+
+-- ============================================================
+-- VERIFICACIÓN
+-- ============================================================
+
+-- 1. Tabla de adjuntos creada
+SELECT 'reservation_attachments' AS tabla,
+       COUNT(*) AS columnas
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'core' AND TABLE_NAME = 'reservation_attachments';
+
+-- 2. Tabla de bloqueos creada
+SELECT 'user_blocks' AS tabla,
+       COUNT(*) AS columnas
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'auth' AND TABLE_NAME = 'user_blocks';
+
+-- 3. Columnas nuevas en reservation_participants
+SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'core' 
+  AND TABLE_NAME = 'reservation_participants'
+  AND COLUMN_NAME IN ('invitation_status', 'invitation_response_at', 'invitation_blocked_by_id')
+ORDER BY COLUMN_NAME;
+
+USE TechnosoftRooms;
+GO
+
+CREATE TABLE core.reservation_history (
+    history_id INT IDENTITY(1,1) PRIMARY KEY,
+    reservation_id INT NOT NULL,
+    action_type VARCHAR(40) NOT NULL,
+    action_by INT NOT NULL,
+    action_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+    details NVARCHAR(MAX) NULL,
+    
+    CONSTRAINT FK_reservation_history_reservation 
+        FOREIGN KEY (reservation_id) REFERENCES core.reservations(reservation_id) 
+        ON DELETE CASCADE,
+    CONSTRAINT FK_reservation_history_user 
+        FOREIGN KEY (action_by) REFERENCES auth.users(user_id)
+);
+GO
+
+CREATE INDEX IX_reservation_history_reservation 
+    ON core.reservation_history(reservation_id, action_at DESC);
+GO
+
+CREATE INDEX IX_reservation_history_action_by 
+    ON core.reservation_history(action_by, action_at DESC);
+GO
+
+-- Verificación
+SELECT 
+    COLUMN_NAME, 
+    DATA_TYPE, 
+    IS_NULLABLE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'core' AND TABLE_NAME = 'reservation_history'
+ORDER BY ORDINAL_POSITION;
+
+ALTER TABLE core.reservation_attendance ADD justification VARCHAR(200) NULL;
+GO
+
+-- Verificación
+SELECT COLUMN_NAME, DATA_TYPE 
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'core' 
+  AND TABLE_NAME = 'reservation_attendance';
+
+
+
+USE TechnosoftRooms;
+GO
+
+-- ============================================================
+-- Notas con hilos (1 nivel)
+-- ============================================================
+CREATE TABLE core.reservation_notes (
+    note_id INT IDENTITY(1,1) PRIMARY KEY,
+    reservation_id INT NOT NULL,
+    parent_note_id INT NULL,  -- NULL = nota raíz, si tiene valor = respuesta
+    author_id INT NOT NULL,
+    content NVARCHAR(2000) NOT NULL,
+    is_deleted BIT NOT NULL DEFAULT 0,
+    deleted_by INT NULL,
+    deleted_at DATETIME2 NULL,
+    edited_at DATETIME2 NULL,
+    created_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+    
+    CONSTRAINT FK_notes_reservation FOREIGN KEY (reservation_id) 
+        REFERENCES core.reservations(reservation_id) ON DELETE CASCADE,
+    CONSTRAINT FK_notes_author FOREIGN KEY (author_id) REFERENCES auth.users(user_id),
+    CONSTRAINT FK_notes_parent FOREIGN KEY (parent_note_id) REFERENCES core.reservation_notes(note_id),
+    CONSTRAINT FK_notes_deleted_by FOREIGN KEY (deleted_by) REFERENCES auth.users(user_id)
+);
+GO
+
+CREATE INDEX IX_notes_reservation ON core.reservation_notes(reservation_id, created_at DESC);
+CREATE INDEX IX_notes_parent ON core.reservation_notes(parent_note_id) WHERE parent_note_id IS NOT NULL;
+GO
+
+-- ============================================================
+-- Resumen colaborativo (append-only)
+-- ============================================================
+CREATE TABLE core.reservation_summary_items (
+    item_id INT IDENTITY(1,1) PRIMARY KEY,
+    reservation_id INT NOT NULL,
+    author_id INT NOT NULL,
+    content NVARCHAR(2000) NOT NULL,
+    item_order INT NOT NULL,
+    created_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+    
+    CONSTRAINT FK_summary_reservation FOREIGN KEY (reservation_id) 
+        REFERENCES core.reservations(reservation_id) ON DELETE CASCADE,
+    CONSTRAINT FK_summary_author FOREIGN KEY (author_id) REFERENCES auth.users(user_id)
+);
+GO
+
+CREATE INDEX IX_summary_reservation ON core.reservation_summary_items(reservation_id, item_order);
+GO
+
+-- ============================================================
+-- Preferencias de notificación por usuario
+-- ============================================================
+CREATE TABLE auth.user_notification_preferences (
+    user_id INT PRIMARY KEY,
+    email_new_note BIT NOT NULL DEFAULT 1,
+    email_note_reply BIT NOT NULL DEFAULT 1,
+    email_summary_change BIT NOT NULL DEFAULT 1,
+    email_participation_cancelled BIT NOT NULL DEFAULT 1,
+    email_reminders BIT NOT NULL DEFAULT 1,
+    email_blocked_invitation BIT NOT NULL DEFAULT 1,
+    email_attendance_marked BIT NOT NULL DEFAULT 0,
+    updated_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+    
+    CONSTRAINT FK_notif_prefs_user FOREIGN KEY (user_id) REFERENCES auth.users(user_id)
+);
+GO
+
+-- Seed: crear preferencias default para todos los usuarios existentes
+INSERT INTO auth.user_notification_preferences (user_id)
+SELECT user_id FROM auth.users
+WHERE user_id NOT IN (SELECT user_id FROM auth.user_notification_preferences);
+GO
+
+-- ============================================================
+-- VERIFICACIÓN
+-- ============================================================
+SELECT 'reservation_notes' AS tabla, COUNT(*) AS columnas
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'core' AND TABLE_NAME = 'reservation_notes';
+
+SELECT 'reservation_summary_items' AS tabla, COUNT(*) AS columnas
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'core' AND TABLE_NAME = 'reservation_summary_items';
+
+SELECT 'user_notification_preferences' AS tabla, COUNT(*) AS columnas
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'auth' AND TABLE_NAME = 'user_notification_preferences';
+
+SELECT COUNT(*) AS prefs_creadas FROM auth.user_notification_preferences;
+
+
+
+
+USE TechnosoftRooms;
+GO
+
+-- ============================================================
+-- 1. Agregar columnas faltantes a reservation_notes
+-- ============================================================
+
+-- parent_note_id: para hilos de 1 nivel
+ALTER TABLE core.reservation_notes
+ADD parent_note_id INT NULL;
+GO
+
+ALTER TABLE core.reservation_notes
+ADD CONSTRAINT FK_notes_parent 
+    FOREIGN KEY (parent_note_id) REFERENCES core.reservation_notes(note_id);
+GO
+
+-- Soft delete
+ALTER TABLE core.reservation_notes
+ADD is_deleted BIT NOT NULL DEFAULT 0;
+GO
+
+ALTER TABLE core.reservation_notes
+ADD deleted_by INT NULL;
+GO
+
+ALTER TABLE core.reservation_notes
+ADD CONSTRAINT FK_notes_deleted_by 
+    FOREIGN KEY (deleted_by) REFERENCES auth.users(user_id);
+GO
+
+ALTER TABLE core.reservation_notes
+ADD deleted_at DATETIME2 NULL;
+GO
+
+-- Edición (edited_at ya existe como updated_at, agregamos contador)
+ALTER TABLE core.reservation_notes
+ADD edit_count INT NOT NULL DEFAULT 0;
+GO
+
+-- ============================================================
+-- 2. Crear tabla de historial de ediciones
+-- ============================================================
+CREATE TABLE core.reservation_note_edits (
+    edit_id INT IDENTITY(1,1) PRIMARY KEY,
+    note_id INT NOT NULL,
+    previous_content NVARCHAR(2000) NOT NULL,
+    edited_by INT NOT NULL,
+    edited_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+    
+    CONSTRAINT FK_note_edits_note 
+        FOREIGN KEY (note_id) REFERENCES core.reservation_notes(note_id) ON DELETE CASCADE,
+    CONSTRAINT FK_note_edits_user 
+        FOREIGN KEY (edited_by) REFERENCES auth.users(user_id)
+);
+GO
+
+CREATE INDEX IX_note_edits_note 
+    ON core.reservation_note_edits(note_id, edited_at DESC);
+GO
+
+-- ============================================================
+-- 3. Índices que faltaron en reservation_notes
+-- ============================================================
+CREATE INDEX IX_notes_reservation 
+    ON core.reservation_notes(reservation_id, created_at DESC);
+GO
+
+CREATE INDEX IX_notes_parent 
+    ON core.reservation_notes(parent_note_id) 
+    WHERE parent_note_id IS NOT NULL;
+GO
+
+-- ============================================================
+-- VERIFICACIÓN
+-- ============================================================
+
+SELECT 'reservation_notes' AS tabla, COUNT(*) AS columnas
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'core' AND TABLE_NAME = 'reservation_notes';
+-- Esperado: 11 columnas
+
+SELECT 'reservation_note_edits' AS tabla, COUNT(*) AS columnas
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'core' AND TABLE_NAME = 'reservation_note_edits';
+-- Esperado: 5 columnas
+
+-- Verificar que parent_note_id existe
+SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'core' 
+  AND TABLE_NAME = 'reservation_notes'
+  AND COLUMN_NAME IN ('parent_note_id', 'is_deleted', 'deleted_by', 'deleted_at', 'edit_count')
+ORDER BY COLUMN_NAME;
+-- Esperado: 5 filas
+
+
+USE TechnosoftRooms;
+GO
+
+SELECT name AS index_name
+FROM sys.indexes
+WHERE object_id = OBJECT_ID('core.reservation_notes')
+ORDER BY name;
+
+
+USE TechnosoftRooms;
+GO
+
+-- ============================================================
+-- Tabla maestra de series recurrentes
+-- ============================================================
+CREATE TABLE core.recurring_series (
+    series_id INT IDENTITY(1,1) PRIMARY KEY,
+    
+    -- Datos base de la reunión
+    title NVARCHAR(200) NOT NULL,
+    description NVARCHAR(MAX) NULL,
+    reservation_type VARCHAR(20) NOT NULL,  -- 'physical' | 'virtual' | 'external'
+    room_id INT NULL,
+    meeting_link NVARCHAR(1000) NULL,
+    external_address NVARCHAR(500) NULL,
+    
+    -- Datos de la recurrencia
+    pattern VARCHAR(20) NOT NULL,           -- 'daily' | 'weekly' | 'biweekly' | 'monthly'
+    days_of_week VARCHAR(30) NULL,          -- '1,2,3' (lun-mar-mié) — para weekly/biweekly
+    day_of_month INT NULL,                  -- 15 — para monthly (día del mes)
+    
+    -- Horario (cada instancia hereda)
+    start_time TIME NOT NULL,               -- 09:00
+    end_time TIME NOT NULL,                 -- 10:00
+    
+    -- Rango de fechas de la serie
+    series_start_date DATE NOT NULL,
+    series_end_date DATE NOT NULL,          -- Máximo 1 año desde start
+    
+    -- Auditoría
+    created_by INT NOT NULL,
+    created_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+    is_active BIT NOT NULL DEFAULT 1,
+    
+    CONSTRAINT FK_recurring_room FOREIGN KEY (room_id) REFERENCES core.rooms(room_id),
+    CONSTRAINT FK_recurring_creator FOREIGN KEY (created_by) REFERENCES auth.users(user_id),
+    CONSTRAINT CK_recurring_pattern CHECK (pattern IN ('daily', 'weekly', 'biweekly', 'monthly')),
+    CONSTRAINT CK_recurring_type CHECK (reservation_type IN ('physical', 'virtual', 'external'))
+);
+GO
+
+CREATE INDEX IX_recurring_creator ON core.recurring_series(created_by, is_active);
+CREATE INDEX IX_recurring_active ON core.recurring_series(is_active, series_end_date);
+GO
+
+-- ============================================================
+-- Participantes base de la serie (se replican en cada instancia)
+-- ============================================================
+CREATE TABLE core.recurring_series_participants (
+    series_id INT NOT NULL,
+    user_id INT NOT NULL,
+    PRIMARY KEY (series_id, user_id),
+    CONSTRAINT FK_rsp_series FOREIGN KEY (series_id) 
+        REFERENCES core.recurring_series(series_id) ON DELETE CASCADE,
+    CONSTRAINT FK_rsp_user FOREIGN KEY (user_id) REFERENCES auth.users(user_id)
+);
+GO
+
+-- ============================================================
+-- Departamentos base de la serie (igual)
+-- ============================================================
+CREATE TABLE core.recurring_series_departments (
+    series_id INT NOT NULL,
+    department_id INT NOT NULL,
+    PRIMARY KEY (series_id, department_id),
+    CONSTRAINT FK_rsd_series FOREIGN KEY (series_id) 
+        REFERENCES core.recurring_series(series_id) ON DELETE CASCADE,
+    CONSTRAINT FK_rsd_department FOREIGN KEY (department_id) REFERENCES auth.departments(department_id)
+);
+GO
+
+-- ============================================================
+-- Vincular core.reservations a la serie
+-- ============================================================
+ALTER TABLE core.reservations
+ADD recurring_series_id INT NULL;
+GO
+
+ALTER TABLE core.reservations
+ADD CONSTRAINT FK_reservations_recurring 
+    FOREIGN KEY (recurring_series_id) REFERENCES core.recurring_series(series_id);
+GO
+
+-- Flag para saber si una instancia fue modificada respecto a la serie (excepción)
+ALTER TABLE core.reservations
+ADD is_exception BIT NOT NULL DEFAULT 0;
+GO
+
+CREATE INDEX IX_reservations_series 
+    ON core.reservations(recurring_series_id) 
+    WHERE recurring_series_id IS NOT NULL;
+GO
+
+-- ============================================================
+-- VERIFICACIÓN
+-- ============================================================
+SELECT 'recurring_series' AS tabla, COUNT(*) AS columnas
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'core' AND TABLE_NAME = 'recurring_series';
+
+SELECT 'recurring_series_participants' AS tabla, COUNT(*) AS columnas
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'core' AND TABLE_NAME = 'recurring_series_participants';
+
+SELECT 'recurring_series_departments' AS tabla, COUNT(*) AS columnas
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'core' AND TABLE_NAME = 'recurring_series_departments';
+
+-- Verificar columnas nuevas en reservations
+SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'core' 
+  AND TABLE_NAME = 'reservations'
+  AND COLUMN_NAME IN ('recurring_series_id', 'is_exception');
+
+
+USE TechnosoftRooms;
+GO
+
+ALTER TABLE auth.users ADD avatar_prompt_seen BIT NOT NULL DEFAULT 0;
+GO
+
+-- Verificación
+SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'auth' 
+  AND TABLE_NAME = 'users' 
+  AND COLUMN_NAME = 'avatar_prompt_seen';
+
+
+USE TechnosoftRooms;
+GO
+
+-- 1. Agregar columna nueva
+ALTER TABLE core.recurring_series 
+ADD frequency_weeks INT NULL;
+GO
+
+-- 2. Migrar las series existentes al nuevo modelo
+-- daily (todos los días) → weekly con todos los días + frequency_weeks=1
+UPDATE core.recurring_series
+SET pattern = 'weekly',
+    days_of_week = '1,2,3,4,5,6,7',
+    frequency_weeks = 1
+WHERE pattern = 'daily';
+
+-- weekly existente → frequency_weeks=1
+UPDATE core.recurring_series
+SET frequency_weeks = 1
+WHERE pattern = 'weekly';
+
+-- biweekly existente → pattern=weekly + frequency_weeks=2
+UPDATE core.recurring_series
+SET pattern = 'weekly',
+    frequency_weeks = 2
+WHERE pattern = 'biweekly';
+
+-- monthly → frequency_weeks queda NULL (no aplica)
+-- (no requiere UPDATE)
+
+-- 3. Actualizar el CHECK constraint del pattern para quitar daily/biweekly
+ALTER TABLE core.recurring_series
+DROP CONSTRAINT CK_recurring_pattern;
+GO
+
+ALTER TABLE core.recurring_series
+ADD CONSTRAINT CK_recurring_pattern 
+    CHECK (pattern IN ('weekly', 'monthly'));
+GO
+
+-- 4. Verificación
+SELECT pattern, COUNT(*) AS cuantas, 
+       MIN(days_of_week) AS sample_days, 
+       MIN(frequency_weeks) AS sample_freq
+FROM core.recurring_series
+GROUP BY pattern;
+
+
+-- ============================================================
+-- SQL Sprint 2: Notas personales y de departamento
+-- ============================================================
+-- Tabla nueva: core.user_notes
+-- Soporta 2 tipos de notas:
+--   - 'personal': solo el autor las ve
+--   - 'department': todo el departamento del autor las ve
+--
+-- Cada nota tiene:
+--   - Titulo (opcional, max 120)
+--   - Contenido (max 2000)
+--   - Color (post-it visual)
+--   - is_done (checkbox opcional)
+--   - Fecha de creacion/actualizacion
+-- ============================================================
+
+USE TechnosoftRooms;
+GO
+
+CREATE TABLE core.user_notes (
+    note_id INT IDENTITY(1,1) PRIMARY KEY,
+    author_id INT NOT NULL,
+    department_id INT NULL,            -- copia del departamento del autor al momento de crear (para queries rapidas)
+    visibility VARCHAR(20) NOT NULL,   -- 'personal' | 'department'
+    title NVARCHAR(120) NULL,
+    content NVARCHAR(2000) NOT NULL,
+    color_hex VARCHAR(20) NOT NULL DEFAULT '#FEF3C7', -- amarillo post-it default
+    is_done BIT NOT NULL DEFAULT 0,
+    sort_order INT NOT NULL DEFAULT 0, -- para ordenar manualmente en futuro
+    created_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+    updated_at DATETIME2 NULL,
+    
+    CONSTRAINT FK_user_notes_author 
+        FOREIGN KEY (author_id) REFERENCES auth.users(user_id),
+    CONSTRAINT FK_user_notes_department 
+        FOREIGN KEY (department_id) REFERENCES auth.departments(department_id),
+    CONSTRAINT CK_user_notes_visibility 
+        CHECK (visibility IN ('personal', 'department')),
+    CONSTRAINT CK_user_notes_department_for_dept_visibility 
+        CHECK (
+            (visibility = 'personal') 
+            OR (visibility = 'department' AND department_id IS NOT NULL)
+        )
+);
+GO
+
+-- Indices para queries rapidas
+CREATE INDEX IX_user_notes_author 
+    ON core.user_notes(author_id, created_at DESC);
+GO
+
+CREATE INDEX IX_user_notes_department 
+    ON core.user_notes(department_id, created_at DESC) 
+    WHERE department_id IS NOT NULL;
+GO
+
+-- ============================================================
+-- VERIFICACION
+-- ============================================================
+SELECT 'user_notes' AS tabla, COUNT(*) AS columnas
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'core' AND TABLE_NAME = 'user_notes';
+-- Esperado: 11 columnas
+
+-- Listar columnas
+SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, CHARACTER_MAXIMUM_LENGTH
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'core' 
+  AND TABLE_NAME = 'user_notes'
+ORDER BY ORDINAL_POSITION;
+
+-- Verificar indices
+SELECT name AS index_name
+FROM sys.indexes
+WHERE object_id = OBJECT_ID('core.user_notes')
+ORDER BY name;
+-- Esperado: PK + IX_user_notes_author + IX_user_notes_department
+
+-- Verificar constraints
+SELECT name, type_desc
+FROM sys.check_constraints
+WHERE parent_object_id = OBJECT_ID('core.user_notes')
+ORDER BY name;
+-- Esperado: CK_user_notes_visibility + CK_user_notes_department_for_dept_visibility
+
+
+-- ============================================================
+-- SQL Sprint Agenda + Dashboard reordenable
+-- ============================================================
+-- 3 cambios:
+--   1. Tabla nueva: core.user_reminders
+--   2. ALTER auth.user_notification_preferences (3 columnas browser_*)
+--   3. ALTER core.user_notes (columna is_pinned)
+--   4. Tabla nueva: auth.user_dashboard_layout
+-- ============================================================
+
+USE TechnosoftRooms;
+GO
+
+-- ============================================================
+-- 1. RECORDATORIOS
+-- ============================================================
+
+CREATE TABLE core.user_reminders (
+    reminder_id INT IDENTITY(1,1) PRIMARY KEY,
+    user_id INT NOT NULL,
+    title NVARCHAR(120) NOT NULL,
+    content NVARCHAR(2000) NULL,
+    remind_at DATETIME2 NOT NULL,
+    is_done BIT NOT NULL DEFAULT 0,
+    notified BIT NOT NULL DEFAULT 0,           -- 1 si ya se disparo la notif del navegador
+    notified_at DATETIME2 NULL,
+    created_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+    updated_at DATETIME2 NULL,
+    
+    CONSTRAINT FK_user_reminders_user 
+        FOREIGN KEY (user_id) REFERENCES auth.users(user_id)
+);
+GO
+
+CREATE INDEX IX_user_reminders_user_pending 
+    ON core.user_reminders(user_id, remind_at)
+    WHERE is_done = 0;
+GO
+
+CREATE INDEX IX_user_reminders_dispatch 
+    ON core.user_reminders(remind_at, notified)
+    WHERE is_done = 0 AND notified = 0;
+GO
+
+-- ============================================================
+-- 2. AMPLIAR PREFERENCIAS DE NOTIFICACIONES
+-- ============================================================
+
+ALTER TABLE auth.user_notification_preferences
+ADD browser_meeting_reminder BIT NOT NULL DEFAULT 1;
+GO
+
+ALTER TABLE auth.user_notification_preferences
+ADD browser_meeting_reminder_minutes INT NOT NULL DEFAULT 10;
+GO
+
+ALTER TABLE auth.user_notification_preferences
+ADD browser_reminder_due BIT NOT NULL DEFAULT 1;
+GO
+
+ALTER TABLE auth.user_notification_preferences
+ADD CONSTRAINT CK_browser_meeting_reminder_minutes_valid
+    CHECK (browser_meeting_reminder_minutes IN (5, 10, 15, 30, 60));
+GO
+
+-- ============================================================
+-- 3. PIN A NOTAS
+-- ============================================================
+
+ALTER TABLE core.user_notes
+ADD is_pinned BIT NOT NULL DEFAULT 0;
+GO
+
+CREATE INDEX IX_user_notes_pinned
+    ON core.user_notes(author_id, is_pinned)
+    WHERE is_pinned = 1;
+GO
+
+-- ============================================================
+-- 4. LAYOUT PERSONALIZADO DEL DASHBOARD
+-- ============================================================
+
+CREATE TABLE auth.user_dashboard_layout (
+    layout_id INT IDENTITY(1,1) PRIMARY KEY,
+    user_id INT NOT NULL,
+    layout_json NVARCHAR(MAX) NOT NULL,        -- array de { widgetId, x, y, w, h, visible }
+    updated_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+    
+    CONSTRAINT FK_dashboard_layout_user 
+        FOREIGN KEY (user_id) REFERENCES auth.users(user_id),
+    CONSTRAINT UQ_dashboard_layout_user 
+        UNIQUE (user_id)
+);
+GO
+
+-- ============================================================
+-- VERIFICACION
+-- ============================================================
+
+-- 1. Tabla reminders
+SELECT 'user_reminders' AS tabla, COUNT(*) AS columnas
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'core' AND TABLE_NAME = 'user_reminders';
+-- Esperado: 9 columnas
+
+-- 2. Nuevas columnas browser_*
+SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'auth' 
+  AND TABLE_NAME = 'user_notification_preferences'
+  AND COLUMN_NAME LIKE 'browser%'
+ORDER BY COLUMN_NAME;
+-- Esperado: 3 columnas
+
+-- 3. is_pinned en user_notes
+SELECT COLUMN_NAME, DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'core' 
+  AND TABLE_NAME = 'user_notes'
+  AND COLUMN_NAME = 'is_pinned';
+
+-- 4. Tabla dashboard_layout
+SELECT 'user_dashboard_layout' AS tabla, COUNT(*) AS columnas
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'auth' AND TABLE_NAME = 'user_dashboard_layout';
+-- Esperado: 4 columnas
+
+
+-- ============================================================
+-- SQL Sprint: Tipo "office" + Migracion oficinas
+-- ============================================================
+-- Cambios:
+--   1. Ampliar core.reservations.reservation_type para incluir 'office'.
+--   2. Agregar auth.departments.office_name (nombre de la oficina del depto).
+--   3. Migrar salas tipo "Oficina X" a departamentos.
+--   4. Migrar reuniones que apuntaban a esas salas a type='office'.
+--   5. Marcar las salas oficina como inactivas (no eliminar, soft delete).
+--
+-- IMPORTANTE: Revisa cuidadosamente antes de correr. Hace BACKUP antes.
+-- ============================================================
+
+USE TechnosoftRooms;
+GO
+
+-- BACKUP MENTAL: antes de correr esto, ejecuta:
+--   BACKUP DATABASE TechnosoftRooms TO DISK = 'C:\backup\rooms_pre_office.bak';
+-- O al menos exporta core.reservations y core.rooms a archivos.
+
+-- ============================================================
+-- PASO 1: Ampliar reservation_type para incluir 'office'
+-- ============================================================
+-- Si hay CHECK constraint que limita los valores, dropearlo y recrearlo.
+
+DECLARE @typeConstraintName NVARCHAR(200);
+SELECT @typeConstraintName = cc.name
+FROM sys.check_constraints cc
+INNER JOIN sys.columns c ON c.object_id = cc.parent_object_id
+WHERE cc.parent_object_id = OBJECT_ID('core.reservations')
+  AND c.name = 'reservation_type'
+  AND cc.definition LIKE '%physical%';
+
+IF @typeConstraintName IS NOT NULL
+BEGIN
+    DECLARE @drop NVARCHAR(MAX) = 'ALTER TABLE core.reservations DROP CONSTRAINT ' + @typeConstraintName;
+    EXEC sp_executesql @drop;
+    PRINT 'Constraint anterior eliminado: ' + @typeConstraintName;
+END
+GO
+
+-- Recrear constraint con el nuevo valor
+ALTER TABLE core.reservations
+ADD CONSTRAINT CK_reservations_reservation_type
+    CHECK (reservation_type IN ('physical', 'virtual', 'external', 'office'));
+GO
+
+-- ============================================================
+-- PASO 2: Agregar campo office_name a departamentos
+-- ============================================================
+ALTER TABLE auth.departments
+ADD office_name NVARCHAR(80) NULL;
+GO
+
+-- ============================================================
+-- PASO 3: Detectar salas que son "oficinas" y mapearlas a departamentos
+-- ============================================================
+-- Heuristica: salas cuyo nombre empieza con "Oficina" se consideran oficinas de departamento.
+-- Si el nombre coincide con el nombre de un departamento, se asocian.
+
+-- Ver que salas tipo oficina existen
+SELECT room_id, name, is_active 
+FROM core.rooms 
+WHERE name LIKE 'Oficina %'
+ORDER BY name;
+
+-- Setear office_name en cada departamento usando heuristica
+-- (Adapta segun los nombres reales que tengas):
+UPDATE d
+SET d.office_name = r.name
+FROM auth.departments d
+INNER JOIN core.rooms r ON r.name = 'Oficina ' + d.name
+WHERE r.name LIKE 'Oficina %';
+
+-- Para los departamentos que no tienen match exacto, asignar nombre default
+UPDATE auth.departments
+SET office_name = 'Oficina ' + name
+WHERE office_name IS NULL;
+GO
+
+-- Verificar mapeo
+SELECT department_id, name, office_name
+FROM auth.departments
+ORDER BY department_id;
+
+-- ============================================================
+-- PASO 4: Migrar reuniones que apuntaban a salas "Oficina X"
+-- ============================================================
+-- Convierte type='physical' + room apuntando a oficina → type='office' + room_id NULL.
+-- Guarda el departamento mediante el organizador (no se almacena explicito).
+
+-- Ver cuantas reuniones se van a migrar
+SELECT COUNT(*) AS total_a_migrar
+FROM core.reservations r
+INNER JOIN core.rooms s ON s.room_id = r.room_id
+WHERE r.reservation_type = 'physical'
+  AND s.name LIKE 'Oficina %';
+
+-- Migrar
+-- NOTA: el constraint CK_reservations_virtual_fields y CK_reservations_external_fields
+-- exigen que ciertos campos sean NULL salvo si type matchea. Para type='office' 
+-- vamos a permitir room_id NULL (al igual que virtual). Si hay constraints que se rompen,
+-- corregirlos primero.
+
+-- Drop constraints conflictivos si existen
+DECLARE @vfConstraint NVARCHAR(200), @efConstraint NVARCHAR(200);
+SELECT @vfConstraint = name FROM sys.check_constraints
+WHERE parent_object_id = OBJECT_ID('core.reservations')
+  AND name = 'CK_reservations_virtual_fields';
+IF @vfConstraint IS NOT NULL
+    ALTER TABLE core.reservations DROP CONSTRAINT CK_reservations_virtual_fields;
+
+SELECT @efConstraint = name FROM sys.check_constraints
+WHERE parent_object_id = OBJECT_ID('core.reservations')
+  AND name = 'CK_reservations_external_fields';
+IF @efConstraint IS NOT NULL
+    ALTER TABLE core.reservations DROP CONSTRAINT CK_reservations_external_fields;
+GO
+
+-- Ahora si, migrar reuniones de "Oficina X" a type='office'
+UPDATE r
+SET r.reservation_type = 'office',
+    r.room_id = NULL
+FROM core.reservations r
+INNER JOIN core.rooms s ON s.room_id = r.room_id
+WHERE r.reservation_type = 'physical'
+  AND s.name LIKE 'Oficina %';
+GO
+
+-- Recrear constraints actualizados (incluyendo office en las exclusiones)
+ALTER TABLE core.reservations
+ADD CONSTRAINT CK_reservations_virtual_fields
+    CHECK (
+        (reservation_type = 'virtual')
+        OR (virtual_platform IS NULL AND meeting_link IS NULL)
+    );
+GO
+
+ALTER TABLE core.reservations
+ADD CONSTRAINT CK_reservations_external_fields
+    CHECK (
+        (reservation_type = 'external')
+        OR (
+            external_subtype IS NULL 
+            AND external_company IS NULL 
+            AND external_address IS NULL 
+            AND external_maps_url IS NULL 
+            AND external_contact IS NULL
+        )
+    );
+GO
+
+-- Constraint nuevo: si type='office', room_id debe ser NULL
+ALTER TABLE core.reservations
+ADD CONSTRAINT CK_reservations_office_room
+    CHECK (
+        (reservation_type <> 'office') OR (room_id IS NULL)
+    );
+GO
+
+-- Constraint nuevo: si type='physical', room_id NO debe ser NULL
+ALTER TABLE core.reservations
+ADD CONSTRAINT CK_reservations_physical_room
+    CHECK (
+        (reservation_type <> 'physical') OR (room_id IS NOT NULL)
+    );
+GO
+
+-- ============================================================
+-- PASO 5: Desactivar salas tipo "Oficina X" (soft delete)
+-- ============================================================
+-- No las borramos por integridad referencial historica, las marcamos inactivas.
+UPDATE core.rooms
+SET is_active = 0
+WHERE name LIKE 'Oficina %';
+GO
+
+-- ============================================================
+-- VERIFICACION
+-- ============================================================
+
+-- 1. Tipos de reservation existentes (debe incluir 'office')
+SELECT reservation_type, COUNT(*) AS cuantas
+FROM core.reservations
+GROUP BY reservation_type;
+
+-- 2. Salas activas (no debe haber "Oficina X")
+SELECT room_id, name, is_active
+FROM core.rooms
+WHERE is_active = 1
+ORDER BY room_id;
+
+-- 3. Departamentos con office_name
+SELECT department_id, name, office_name
+FROM auth.departments;
+
+-- 4. Reuniones tipo office (deben tener room_id NULL)
+SELECT TOP 5 reservation_id, title, reservation_type, room_id, created_by
+FROM core.reservations
+WHERE reservation_type = 'office';
+
+-- 5. Constraints activos
+SELECT name, type_desc
+FROM sys.check_constraints
+WHERE parent_object_id = OBJECT_ID('core.reservations')
+ORDER BY name;
+-- Esperado: CK_reservations_office_room, CK_reservations_physical_room,
+--           CK_reservations_external_fields, CK_reservations_virtual_fields,
+--           CK_reservations_reservation_type, mas los demas existentes
+
+
+USE TechnosoftRooms;
+GO
+
+-- Dropear el constraint que está bloqueando
+ALTER TABLE core.reservations
+DROP CONSTRAINT CK_reservations_type;
+GO
+
+-- Recrearlo incluyendo 'office'
+ALTER TABLE core.reservations
+ADD CONSTRAINT CK_reservations_type
+    CHECK (reservation_type IN ('physical', 'virtual', 'external', 'office'));
+GO
+
+-- Ahora sí, correr el UPDATE que falló
+UPDATE r
+SET r.reservation_type = 'office',
+    r.room_id = NULL
+FROM core.reservations r
+INNER JOIN core.rooms s ON s.room_id = r.room_id
+WHERE r.reservation_type = 'physical'
+  AND s.name LIKE 'Oficina %';
+GO
+
+-- Verificación: ¿cuántas reuniones quedaron tipo office?
+SELECT reservation_type, COUNT(*) AS total
+FROM core.reservations
+GROUP BY reservation_type;
